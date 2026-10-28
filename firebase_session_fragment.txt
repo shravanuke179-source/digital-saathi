@@ -1,0 +1,144 @@
+    private val auth = runCatching { FirebaseAuth.getInstance() }.getOrNull()
+    private val database = runCatching { FirebaseFirestore.getInstance() }.getOrNull()
+    private val store = database?.let { CloudStore(it) }
+    private val listeners = mutableListOf<ListenerRegistration>()
+    private val mutationLock = Mutex()
+    private val _cloudMessage = MutableStateFlow<String?>(null)
+    val cloudMessage: StateFlow<String?> = _cloudMessage.asStateFlow()
+    private val _cloudBusy = MutableStateFlow(false)
+    val cloudBusy: StateFlow<Boolean> = _cloudBusy.asStateFlow()
+    private var sessionUid: String? = null
+    private val authListener = FirebaseAuth.AuthStateListener { firebase ->
+        val user = firebase.currentUser
+        if (user?.uid != sessionUid || user == null) {
+            clearSession()
+            if (user != null) {
+                sessionUid = user.uid
+                _userProfile.value = UserProfile(name = user.displayName.orEmpty(), email = user.email.orEmpty(),
+                    firebaseUid = user.uid, authProvider = user.providerData.lastOrNull()?.providerId.orEmpty())
+                _isAuthenticated.value = true
+                watchUser(user.uid)
+            }
+        }
+    }
+
+    private fun clearSession() {
+        listeners.forEach { it.remove() }
+        listeners.clear()
+        sessionUid = null
+        _isAuthenticated.value = false
+        _userProfile.value = UserProfile()
+        _currentDestination.value = NavDestination.HOME
+        _submittedApplications.value = emptyList()
+        _grievances.value = emptyList()
+        _produceListings.value = emptyList()
+        _deliveryRequests.value = emptyList()
+        _equipmentBookings.value = emptyList()
+        _notices.value = emptyList()
+        _produceBuyers.value = emptyList()
+        _deliveryPartners.value = emptyList()
+        _farmEquipmentList.value = emptyList()
+        _mandiPrices.value = emptyList()
+        _schemes.value = defaultSchemes.map { it.copy(isBookmarked = false) }
+        _selectedLocation.value = "Palampur, Himachal Pradesh"
+        _userCoordinates.value = Pair(32.1109, 76.5363)
+        _isGpsActive.value = false
+        _cloudMessage.value = null
+        _supabaseSyncStatus.value = SupabaseSyncStatus(false, false, "Signed out", "users/{uid}", 0)
+    }
+
+    private fun watchUser(uid: String) {
+        val db = database ?: return
+        val cloud = store ?: return
+        listeners += db.document("users/$uid").addSnapshotListener { document, error ->
+            if (auth?.currentUser?.uid == uid) {
+                if (error != null) cloudFailure(error)
+                else if (document != null && document.exists()) {
+                    _userProfile.value = _userProfile.value.copy(
+                        name = document.getString("name").orEmpty(), village = document.getString("village").orEmpty(),
+                        district = document.getString("district").orEmpty(), phone = document.getString("phone").orEmpty(),
+                        state = document.getString("state").orEmpty(), isVerified = document.getBoolean("isVerified") ?: false,
+                        rationCardNo = document.getString("rationCardNo").orEmpty(), bankLinked = document.getString("bankLinked").orEmpty(),
+                        isSupabaseSynced = !document.metadata.hasPendingWrites() && !document.metadata.isFromCache,
+                        lastSyncedWithSupabase = if (document.metadata.isFromCache) "Cached" else "Synced with Firestore")
+                    _supabaseSyncStatus.value = SupabaseSyncStatus(!document.metadata.isFromCache, false,
+                        if (document.metadata.isFromCache) "Offline cached profile" else "Connected to Firestore", "users/$uid", 1)
+                } else if (document != null && !document.metadata.isFromCache) {
+                    // Merge only editable fields; never overwrite trusted verification fields.
+                    val initial = _userProfile.value
+                    repositoryScope.launch {
+                        try { if (auth?.currentUser?.uid == uid) saveProfile(initial) }
+                        catch (e: Exception) { cloudFailure(e) }
+                    }
+                }
+            }
+        }
+        fun <T : Any> watch(path: String, type: Class<T>, state: MutableStateFlow<List<T>>) {
+            listeners += cloud.listen(path, type, { if (auth?.currentUser?.uid == uid) cloudFailure(it) }) {
+                if (auth?.currentUser?.uid == uid) state.value = it
+            }
+        }
+        watch("users/$uid/applications", SubmittedApplication::class.java, _submittedApplications)
+        watch("users/$uid/grievances", PanchayatGrievance::class.java, _grievances)
+        watch("users/$uid/produce", ProduceListing::class.java, _produceListings)
+        watch("users/$uid/deliveries", DeliveryRequest::class.java, _deliveryRequests)
+        watch("users/$uid/bookings", EquipmentBooking::class.java, _equipmentBookings)
+        watch("notices", VillageNotice::class.java, _notices)
+        watch("buyers", ProduceBuyer::class.java, _produceBuyers)
+        watch("deliveryPartners", DeliveryPartner::class.java, _deliveryPartners)
+        watch("equipment", FarmEquipment::class.java, _farmEquipmentList)
+        watch("marketPrices", MandiPrice::class.java, _mandiPrices)
+        listeners += db.collection("users/$uid/bookmarks").addSnapshotListener { snapshot, error ->
+            if (auth?.currentUser?.uid == uid) {
+                if (error != null) cloudFailure(error)
+                else if (snapshot != null) {
+                    val ids = snapshot.documents.map { it.id }.toSet()
+                    _schemes.value = _schemes.value.map { it.copy(isBookmarked = it.id in ids) }
+                }
+            }
+        }
+    }
+
+    private fun requireUid(): String = auth?.currentUser?.uid ?: error("Please sign in first.")
+
+    private suspend fun <T : Any> saveRecord(collection: String, id: String, value: T, type: Class<T>) {
+        val uid = requireUid()
+        requireNotNull(store) { "Firebase is not configured." }.save("users/$uid/$collection/$id", value, type)
+        check(auth?.currentUser?.uid == uid) { "Session changed. Please sign in again." }
+    }
+
+    private suspend fun saveProfile(profile: UserProfile) {
+        val uid = requireUid()
+        check(profile.firebaseUid == uid) { "Session changed." }
+        val fields = mapOf("name" to profile.name, "village" to profile.village, "district" to profile.district,
+            "phone" to profile.phone, "state" to profile.state)
+        requireNotNull(database).document("users/$uid").set(fields, com.google.firebase.firestore.SetOptions.merge()).awaitResult()
+        if (auth?.currentUser?.uid == uid) _cloudMessage.value = "Profile saved to Firestore."
+    }
+
+    private fun runMutation(action: suspend () -> Unit) {
+        val uid = auth?.currentUser?.uid
+        repositoryScope.launch {
+            mutationLock.withLock {
+                if (uid == null || auth?.currentUser?.uid != uid) return@withLock
+                _cloudBusy.value = true
+                try { action(); if (auth?.currentUser?.uid == uid) _cloudMessage.value = "Saved to Firestore." }
+                catch (e: CancellationException) { throw e }
+                catch (e: Exception) { if (auth?.currentUser?.uid == uid) cloudFailure(e) }
+                finally { _cloudBusy.value = false }
+            }
+        }
+    }
+
+    private fun cloudFailure(error: Exception) {
+        _cloudMessage.value = error.localizedMessage ?: "Cloud operation failed. Please retry."
+        _supabaseSyncStatus.value = SupabaseSyncStatus(false, false, _cloudMessage.value.orEmpty(), "users/{uid}", 0)
+    }
+
+    fun clearCloudMessage() { _cloudMessage.value = null }
+
+    fun close() {
+        auth?.removeAuthStateListener(authListener)
+        listeners.forEach { it.remove() }
+        repositoryScope.cancel()
+    }

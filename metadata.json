@@ -1,0 +1,6 @@
+{
+  "name": "Digital Saathi",
+  "description": "Your Digital Companion for Village Life — citizen services, government schemes, farming hub, digital education, notice board, and emergency SOS.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,124 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function owner(uid) { return signedIn() && request.auth.uid == uid; }
+    function admin() { return signedIn() && request.auth.token.get('admin', false) == true; }
+    function text(value, max) { return value is string && value.size() <= max; }
+    function nonempty(value, max) { return text(value, max) && value.size() > 0; }
+    function validProfile(d) {
+      return d.keys().hasOnly(['name', 'village', 'district', 'phone', 'state', 'isVerified', 'rationCardNo', 'bankLinked'])
+        && text(d.name, 100) && text(d.village, 120) && text(d.district, 120)
+        && text(d.phone, 30) && text(d.state, 120);
+    }
+    match /users/{uid} {
+      allow read: if owner(uid) || admin();
+      allow create: if owner(uid) && validProfile(request.resource.data)
+        && request.resource.data.keys().hasOnly(['name', 'village', 'district', 'phone', 'state']);
+      allow update: if owner(uid) && validProfile(request.resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'village', 'district', 'phone', 'state']);
+      // Verification, provider status and official processing are trusted server/admin operations.
+      match /bookmarks/{id} {
+        allow read, delete: if owner(uid);
+        allow create, update: if owner(uid) && request.resource.data.keys().hasOnly(['schemeId'])
+          && request.resource.data.schemeId == id && text(id, 100);
+      }
+      match /preferences/{id} {
+        allow read: if owner(uid);
+        allow create, update: if owner(uid) && id == 'settings'
+          && request.resource.data.keys().hasOnly(['language', 'location', 'latitude', 'longitude', 'state'])
+          && request.resource.data.language in ['ENGLISH', 'HINDI', 'MARATHI']
+          && text(request.resource.data.location, 250) && text(request.resource.data.state, 120)
+          && request.resource.data.latitude is number && request.resource.data.latitude >= -90 && request.resource.data.latitude <= 90
+          && request.resource.data.longitude is number && request.resource.data.longitude >= -180 && request.resource.data.longitude <= 180;
+      }
+      match /applications/{id} {
+        allow read: if owner(uid) || admin();
+        allow create: if owner(uid) && request.resource.data.keys().hasOnly(['id', 'schemeTitle', 'schemeTitleHi', 'appId', 'appliedDate', 'status', 'progressPercent', 'applicantName', 'phone', 'aadhaarLastFour'])
+          && request.resource.data.id == id && request.resource.data.appId == id
+          && nonempty(request.resource.data.schemeTitle, 300) && text(request.resource.data.schemeTitleHi, 300)
+          && text(request.resource.data.appliedDate, 40) && nonempty(request.resource.data.applicantName, 100)
+          && text(request.resource.data.phone, 30) && request.resource.data.phone.size() >= 7
+          && request.resource.data.aadhaarLastFour.matches('([0-9]{4})?')
+          && request.resource.data.status == 'Saved — submit through official portal' && request.resource.data.progressPercent == 0;
+      }
+      match /grievances/{id} {
+        allow read: if owner(uid) || admin();
+        allow create: if owner(uid) && request.resource.data.keys().hasOnly(['id', 'category', 'subject', 'description', 'applicantName', 'phone', 'date', 'status'])
+          && request.resource.data.id == id && nonempty(request.resource.data.category, 120)
+          && nonempty(request.resource.data.subject, 200) && nonempty(request.resource.data.description, 5000)
+          && text(request.resource.data.applicantName, 100) && text(request.resource.data.phone, 30)
+          && text(request.resource.data.date, 40) && request.resource.data.status == 'Saved — pending official submission';
+      }
+      match /produce/{id} {
+        function valid(d) {
+          return d.keys().hasOnly(['id', 'cropName', 'category', 'quantity', 'unit', 'expectedPricePerUnit', 'qualityGrade', 'harvestDate', 'pickupLocation', 'preferredBuyerOrMandi', 'productPhoto', 'additionalNotes', 'listedDate', 'status', 'selectedBuyer', 'deliveryRequest'])
+            && d.id == id && nonempty(d.cropName, 120) && text(d.category, 120)
+            && d.quantity is number && d.quantity > 0 && d.quantity <= 1000000
+            && d.expectedPricePerUnit is number && d.expectedPricePerUnit > 0 && d.expectedPricePerUnit <= 100000000
+            && text(d.unit, 80) && text(d.qualityGrade, 80) && text(d.harvestDate, 40)
+            && text(d.pickupLocation, 250) && text(d.preferredBuyerOrMandi, 200)
+            && text(d.productPhoto, 500) && text(d.additionalNotes, 5000) && text(d.listedDate, 40);
+        }
+        function validBuyer(d) {
+          return d.get('selectedBuyer', null) == null ||
+            d.selectedBuyer == get(/databases/$(database)/documents/buyers/$(d.selectedBuyer.id)).data;
+        }
+        function validDelivery(d) {
+          return d.get('deliveryRequest', null) == null ||
+            (d.deliveryRequest.produceListingId == id &&
+             d.deliveryRequest == getAfter(/databases/$(database)/documents/users/$(uid)/deliveries/$(d.deliveryRequest.id)).data);
+        }
+        allow read: if owner(uid) || admin();
+        allow create: if owner(uid) && valid(request.resource.data)
+          && request.resource.data.status == 'ACTIVE_LISTING'
+          && request.resource.data.get('selectedBuyer', null) == null && request.resource.data.get('deliveryRequest', null) == null;
+        allow update: if owner(uid) && valid(request.resource.data) && validBuyer(request.resource.data) && validDelivery(request.resource.data)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['selectedBuyer', 'deliveryRequest', 'status'])
+          && ((resource.data.status in ['ACTIVE_LISTING', 'BUYER_SELECTED'] && request.resource.data.status == 'BUYER_SELECTED'
+               && request.resource.data.get('selectedBuyer', null) != null && request.resource.data.get('deliveryRequest', null) == null)
+            || (resource.data.status in ['ACTIVE_LISTING', 'BUYER_SELECTED'] && request.resource.data.status == 'DELIVERY_REQUESTED'
+               && request.resource.data.get('deliveryRequest', null) != null));
+        allow delete: if owner(uid) && resource.data.status in ['ACTIVE_LISTING', 'BUYER_SELECTED'];
+      }
+      match /deliveries/{id} {
+        allow read: if owner(uid) || admin();
+        allow create: if owner(uid) && request.resource.data.keys().hasOnly(['id', 'produceListingId', 'produceTitle', 'quantity', 'pickupLocation', 'destination', 'pickupDate', 'pickupTime', 'vehicleType', 'deliveryPartner', 'isSelfTransport', 'estimatedFare', 'additionalInstructions', 'status', 'statusUpdatedAt', 'trackingUpdates'])
+          && request.resource.data.id == id && request.resource.data.status == 'REQUESTED'
+          && exists(/databases/$(database)/documents/users/$(uid)/produce/$(request.resource.data.produceListingId))
+          && getAfter(/databases/$(database)/documents/users/$(uid)/produce/$(request.resource.data.produceListingId)).data.deliveryRequest.id == id
+          && nonempty(request.resource.data.produceTitle, 120) && text(request.resource.data.quantity, 120)
+          && text(request.resource.data.pickupLocation, 250) && nonempty(request.resource.data.destination, 250)
+          && nonempty(request.resource.data.pickupDate, 40) && text(request.resource.data.pickupTime, 40)
+          && text(request.resource.data.vehicleType, 120) && text(request.resource.data.additionalInstructions, 5000)
+          && request.resource.data.isSelfTransport is bool && request.resource.data.estimatedFare is number
+          && request.resource.data.estimatedFare >= 0 && request.resource.data.estimatedFare <= 10000000
+          && text(request.resource.data.statusUpdatedAt, 80) && request.resource.data.trackingUpdates is list
+          && request.resource.data.trackingUpdates.size() <= 2
+          && ((request.resource.data.isSelfTransport && request.resource.data.get('deliveryPartner', null) == null)
+            || (!request.resource.data.isSelfTransport && request.resource.data.deliveryPartner == get(/databases/$(database)/documents/deliveryPartners/$(request.resource.data.deliveryPartner.id)).data));
+      }
+      match /bookings/{id} {
+        allow read: if owner(uid) || admin();
+        allow create: if owner(uid) && request.resource.data.keys().hasOnly(['id', 'equipmentId', 'equipmentName', 'providerName', 'bookingDate', 'timeSlot', 'durationOrArea', 'farmLocation', 'instructions', 'estimatedCost', 'status', 'statusDate', 'providerPhone', 'iconEmoji'])
+          && request.resource.data.id == id && request.resource.data.status == 'REQUESTED'
+          && exists(/databases/$(database)/documents/equipment/$(request.resource.data.equipmentId))
+          && text(request.resource.data.equipmentName, 200) && text(request.resource.data.providerName, 150)
+          && nonempty(request.resource.data.bookingDate, 40) && text(request.resource.data.timeSlot, 80)
+          && text(request.resource.data.durationOrArea, 80) && nonempty(request.resource.data.farmLocation, 250)
+          && text(request.resource.data.instructions, 5000) && text(request.resource.data.statusDate, 40)
+          && text(request.resource.data.providerPhone, 30) && text(request.resource.data.iconEmoji, 30)
+          && request.resource.data.estimatedCost is number && request.resource.data.estimatedCost >= 0 && request.resource.data.estimatedCost <= 10000000;
+        allow update: if owner(uid) && resource.data.status in ['REQUESTED', 'ACCEPTED', 'SCHEDULED']
+          && request.resource.data.status == 'CANCELLED'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']);
+      }
+    }
+    // Catalog publishing uses an Admin SDK service or an explicitly assigned admin claim.
+    match /{collection}/{id} {
+      allow read: if signedIn() && collection in ['notices', 'buyers', 'deliveryPartners', 'equipment', 'marketPrices'];
+      allow write: if admin() && collection in ['notices', 'buyers', 'deliveryPartners', 'equipment', 'marketPrices'];
+    }
+    // Everything else, including arbitrary nested paths, is denied by default.
+  }
+}
